@@ -38,6 +38,8 @@ import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.expressions.Literal;
 import org.apache.iceberg.expressions.UnboundPredicate;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterators;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
@@ -936,6 +938,24 @@ public class TestMetadataTableScans extends MetadataTableScanTestBase {
   }
 
   @TestTemplate
+  public void testPuffinFilesTableSchema() {
+    Table puffinFilesTable = new PuffinFilesTable(table);
+
+    Types.StructType expected =
+        new Schema(
+            required(1, "snapshot_id", Types.LongType.get()),
+            required(2, "statistics_path", Types.StringType.get()),
+            required(3, "file_size_in_bytes", Types.LongType.get()),
+            required(4, "file_footer_size_in_bytes", Types.LongType.get()),
+            required(5, "blob_count", Types.IntegerType.get()),
+            optional(6, "blob_types", Types.ListType.ofRequired(7, Types.StringType.get())),
+            optional(8, "field_ids", Types.ListType.ofRequired(9, Types.IntegerType.get())))
+            .asStruct();
+
+    assertThat(puffinFilesTable.schema().asStruct()).isEqualTo(expected);
+  }
+
+  @TestTemplate
   public void testPartitionSpecEvolutionAdditive() {
     preparePartitionedTable();
 
@@ -1831,6 +1851,171 @@ public class TestMetadataTableScans extends MetadataTableScanTestBase {
     assertThat(rowCount(deleteFilesTable.newScan()))
         .as("DeleteFilesTable on main should have 2 delete files")
         .isEqualTo(2);
+  }
+
+  @TestTemplate
+  public void testPuffinFilesTableNoStatisticsFiles() throws IOException {
+    table.newFastAppend().appendFile(FILE_A).commit();
+    Table puffinFilesTable = new PuffinFilesTable(table);
+
+    assertThat(rowCount(puffinFilesTable.newScan()))
+        .as("Puffin files table should have no rows when table has no statistics files")
+        .isEqualTo(0);
+  }
+
+  @TestTemplate
+  public void testPuffinFilesTable() throws IOException {
+    table.newFastAppend().appendFile(FILE_A).commit();
+
+    Snapshot snapshot = table.currentSnapshot();
+    long snapshotId = snapshot.snapshotId();
+    long sequenceNumber = snapshot.sequenceNumber();
+
+    List<BlobMetadata> blobMetadata =
+        ImmutableList.of(
+            new GenericBlobMetadata(
+                "apache-datasketches-theta-v1",
+                snapshotId,
+                sequenceNumber,
+                ImmutableList.of(1),
+                ImmutableMap.of("ndv", "2")),
+            new GenericBlobMetadata(
+                "apache-datasketches-theta-v1",
+                snapshotId,
+                sequenceNumber,
+                ImmutableList.of(2),
+                ImmutableMap.of("ndv", "2")));
+
+    String statisticsPath = table.location() + "/metadata/" + snapshotId + "-test.stats";
+
+    StatisticsFile statisticsFile =
+        new GenericStatisticsFile(snapshotId, statisticsPath, 617L, 523L, blobMetadata);
+
+    table.updateStatistics().setStatistics(statisticsFile).commit();
+
+    Table puffinFilesTable = new PuffinFilesTable(table);
+    List<StructLike> rows = rows(puffinFilesTable.newScan());
+
+    assertThat(rows).hasSize(1);
+
+    StructLike row = rows.get(0);
+
+    assertThat(row.get(0, Long.class)).isEqualTo(snapshotId);
+    assertThat(row.get(1, String.class)).isEqualTo(statisticsPath);
+    assertThat(row.get(2, Long.class)).isEqualTo(617L);
+    assertThat(row.get(3, Long.class)).isEqualTo(523L);
+    assertThat(row.get(4, Integer.class)).isEqualTo(2);
+
+    assertThat(row.get(5, List.class)).containsExactly("apache-datasketches-theta-v1");
+    assertThat(row.get(6, List.class)).containsExactly(1, 2);
+  }
+
+  @TestTemplate
+  public void testPuffinFilesTableProjection() throws IOException {
+    table.newFastAppend().appendFile(FILE_A).commit();
+
+    Snapshot snapshot = table.currentSnapshot();
+    long snapshotId = snapshot.snapshotId();
+    long sequenceNumber = snapshot.sequenceNumber();
+
+    List<BlobMetadata> blobMetadata =
+        ImmutableList.of(
+            new GenericBlobMetadata(
+                "apache-datasketches-theta-v1",
+                snapshotId,
+                sequenceNumber,
+                ImmutableList.of(1),
+                ImmutableMap.of("ndv", "2")));
+
+    String statisticsPath = table.location() + "/metadata/" + snapshotId + "-projected.stats";
+
+    StatisticsFile statisticsFile =
+        new GenericStatisticsFile(snapshotId, statisticsPath, 617L, 523L, blobMetadata);
+
+    table.updateStatistics().setStatistics(snapshotId, statisticsFile).commit();
+
+    Table puffinFilesTable = new PuffinFilesTable(table);
+
+    TableScan scan = puffinFilesTable.newScan().select("statistics_path", "blob_count");
+
+    Types.StructType expected =
+        new Schema(
+            required(2, "statistics_path", Types.StringType.get()),
+            required(5, "blob_count", Types.IntegerType.get()))
+            .asStruct();
+
+    assertThat(scan.schema().asStruct()).isEqualTo(expected);
+
+    List<StructLike> rows = rows(scan);
+
+    assertThat(rows).hasSize(1);
+    assertThat(rows.get(0).get(0, String.class)).isEqualTo(statisticsPath);
+    assertThat(rows.get(0).get(1, Integer.class)).isEqualTo(1);
+  }
+
+  @TestTemplate
+  public void testPuffinFilesTableAggregatesBlobTypesAndFieldIds() throws IOException {
+    table.newFastAppend().appendFile(FILE_A).commit();
+
+    Snapshot snapshot = table.currentSnapshot();
+    long snapshotId = snapshot.snapshotId();
+    long sequenceNumber = snapshot.sequenceNumber();
+
+    List<BlobMetadata> blobMetadata =
+        ImmutableList.of(
+            new GenericBlobMetadata(
+                "apache-datasketches-theta-v1",
+                snapshotId,
+                sequenceNumber,
+                ImmutableList.of(1),
+                ImmutableMap.of("ndv", "2")),
+            new GenericBlobMetadata(
+                "apache-datasketches-theta-v1",
+                snapshotId,
+                sequenceNumber,
+                ImmutableList.of(1),
+                ImmutableMap.of("ndv", "2")),
+            new GenericBlobMetadata(
+                "test-custom-blob-v1",
+                snapshotId,
+                sequenceNumber,
+                ImmutableList.of(2),
+                ImmutableMap.of("purpose", "test")));
+
+    String statisticsPath = table.location() + "/metadata/" + snapshotId + "-mixed.stats";
+
+    StatisticsFile statisticsFile =
+        new GenericStatisticsFile(snapshotId, statisticsPath, 617L, 523L, blobMetadata);
+
+    table.updateStatistics().setStatistics(snapshotId, statisticsFile).commit();
+
+    Table puffinFilesTable = new PuffinFilesTable(table);
+    List<StructLike> rows = rows(puffinFilesTable.newScan());
+
+    assertThat(rows).hasSize(1);
+
+    StructLike row = rows.get(0);
+
+    assertThat(row.get(4, Integer.class)).isEqualTo(3);
+    assertThat(row.get(5, List.class))
+        .containsExactly("apache-datasketches-theta-v1", "test-custom-blob-v1");
+    assertThat(row.get(6, List.class)).containsExactly(1, 2);
+  }
+
+  private static List<StructLike> rows(TableScan scan) throws IOException {
+    ImmutableList.Builder<StructLike> rows = ImmutableList.builder();
+
+    try (CloseableIterable<FileScanTask> tasks = scan.planFiles()) {
+      for (FileScanTask task : tasks) {
+        assertThat(task).isInstanceOf(DataTask.class);
+
+        try (CloseableIterable<StructLike> taskRows = ((DataTask) task).rows()) {
+          rows.addAll(taskRows);
+        }
+      }
+    }
+
+    return rows.build();
   }
 
   private int rowCount(TableScan scan) throws IOException {
